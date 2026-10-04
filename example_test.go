@@ -57,3 +57,38 @@ func ExampleFlagSet_StringToString() {
 	fmt.Println(value)
 	// Output: map[a:2 b:2 d:4]
 }
+
+func ExampleIntListVar() {
+	fs := pflag.NewFlagSet("Example", pflag.ContinueOnError)
+	var list []int
+	fs.IntListVar(&list, "il", []int{1, 2}, "integer list supporting =replace, +append, -delete operations")
+
+	// Repeated occurrences run in command-line order.
+	if err := fs.Parse([]string{"--il=+3", "--il=-1", "--il=+2"}); err != nil {
+		panic(err)
+	}
+	fmt.Println(list)
+
+	// A failed operation leaves the list at its baseline.
+	if err := fs.Parse([]string{"--il=+bad"}); err != nil {
+		fmt.Println("error:", err)
+	}
+	fmt.Println(list)
+	// Output: [2 3 2]
+	// error: invalid argument "+bad" for "--il" flag: strconv.Atoi: parsing "bad": invalid syntax
+	// [2 3 2]
+}
+
+func ExampleIntListVar_negative() {
+	fs := pflag.NewFlagSet("Example", pflag.ContinueOnError)
+	var list []int
+	fs.IntListVar(&list, "il", []int{1, -2}, "integer list supporting =replace, +append, -delete operations")
+
+	// Negative integers are parenthesized so they are not confused with the
+	// delete operator: +(-3) appends -3, while -3 deletes every 3.
+	if err := fs.Parse([]string{"--il=+(-3)", "--il=-(-2)"}); err != nil {
+		panic(err)
+	}
+	fmt.Println(list)
+	// Output: [1 -3]
+}

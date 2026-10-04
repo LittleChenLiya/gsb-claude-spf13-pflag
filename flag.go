@@ -627,7 +627,7 @@ func (f *Flag) defaultIsZeroValue() bool {
 		return f.DefValue == ""
 	case *ipValue, *ipMaskValue, *ipNetValue:
 		return f.DefValue == "<nil>"
-	case *intSliceValue, *stringSliceValue, *stringArrayValue:
+	case *intSliceValue, *intListValue, *stringSliceValue, *stringArrayValue:
 		return f.DefValue == "[]"
 	default:
 		switch f.DefValue {
@@ -683,6 +683,8 @@ func UnquoteUsage(flag *Flag) (name string, usage string) {
 	case "stringSlice":
 		name = "strings"
 	case "intSlice":
+		name = "ints"
+	case "intList":
 		name = "ints"
 	case "uintSlice":
 		name = "uints"
