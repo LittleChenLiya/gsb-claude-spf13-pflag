@@ -124,6 +124,45 @@ in a command-line interface. The methods of FlagSet are
 analogous to the top-level functions for the command-line
 flag set.
 
+## Mutable integer list flag (IntList)
+
+`IntList` is a registerable `[]int` flag (registered through the standard
+`Value` interface) whose repeated command-line occurrences describe
+explicit list operations, applied in command-line order. It complements
+the immutable-append `IntSlice` and does not change it.
+
+Each occurrence starts with one of these operators:
+
+| Form       | Operation                                                        |
+|------------|------------------------------------------------------------------|
+| `=1,2`     | Replace the whole list with `1,2`.                               |
+| `1,2`      | Same as `=`; a value without an operator also replaces.          |
+| `=` or ``  | Replace with an empty list (clear it).                           |
+| `+3`       | Append `3` to the end, preserving order.                         |
+| `-1`       | Remove **every** element equal to `1`, preserving the rest.      |
+
+Negative integers use an explicit, distinguishable syntax so they can never
+be read as the `-` removal marker: `+-3` appends `-3` and `--3` removes
+every `-3` element, while a bare `-3` removes positive `3`.
+
+```go
+var ids []int
+flag.IntListVar(&ids, "id", []int{1, 2}, "ids: =replace, +append, -remove")
+flag.Parse()
+// --id=+3 --id=-1 --id=+2  ->  [2 3 2]
+```
+
+**Baseline and atomicity.** The default value (or any value the variable
+holds when parsing starts) is the *baseline*. All occurrences within a
+single `Parse` call form one atomic transaction: if any occurrence is
+invalid, the flag is restored to that parse's baseline, as if none of the
+occurrences had happened. `Changed` is only set after a parse that applied
+at least one operation successfully; a fully failed parse leaves it
+untouched. A successful parse commits, so the next `Parse` starts its
+baseline from the committed value. Conversion errors use the same
+`invalid argument ... for ... flag` wording as the other integer flags.
+`Set` called directly outside of `Parse` applies the operation immediately.
+
 ## Setting no option default values for flags
 
 After you create a flag it is possible to set the pflag.NoOptDefVal for

@@ -207,6 +207,8 @@ type FlagSet struct {
 	normalizeNameFunc func(f *FlagSet, name string) NormalizedName
 
 	addedGoFlagSets []*goflag.FlagSet
+
+	transaction *parseTransaction
 }
 
 // A Flag represents the state of a flag.
@@ -230,6 +232,22 @@ type Value interface {
 	String() string
 	Set(string) error
 	Type() string
+}
+
+// transactionalValue is implemented by Values whose repeated Set calls
+// within one Parse invocation form a single atomic unit. When parsing a
+// command line, the FlagSet calls BeginTransaction once on every flag
+// implementing this interface before any value is set. If parsing fails,
+// RollbackTransaction is called and each value must restore itself to the
+// snapshot captured in BeginTransaction. Values that do not implement this
+// interface keep the historical per-Set behavior and are not rolled back.
+type transactionalValue interface {
+	// BeginTransaction captures the value that subsequent Set calls start
+	// from (the parse baseline) and opens a new per-parse transaction.
+	BeginTransaction()
+	// RollbackTransaction abandons every Set call performed since the
+	// matching BeginTransaction and restores the captured baseline.
+	RollbackTransaction()
 }
 
 // SliceValue is a secondary interface to all flags which hold a list
@@ -1285,6 +1303,80 @@ func (f *FlagSet) parseArgs(args []string, fn parseFunc) (err error) {
 	return
 }
 
+// parseTransaction records the per-flag state of the transactional Values
+// that participate in a Parse call, so that a failed parse can roll back
+// only those flags atomically without disturbing other flags.
+type parseTransaction struct {
+	// entries holds one entry per flag whose Value implements
+	// transactionalValue, in registration order.
+	entries []transactionEntry
+}
+
+// transactionEntry captures a transactional flag's pre-parse state.
+type transactionEntry struct {
+	flag    *Flag
+	tv      transactionalValue
+	changed bool
+	name    NormalizedName
+}
+
+// beginTransaction opens an atomic parse scope. Transactional values
+// snapshot their current contents as the baseline and their Flag.Changed
+// state is recorded so a failed parse leaves those flags untouched.
+func (f *FlagSet) beginTransaction() {
+	tx := new(parseTransaction)
+	for _, flag := range f.formal {
+		tv, ok := flag.Value.(transactionalValue)
+		if !ok {
+			continue
+		}
+		tv.BeginTransaction()
+		tx.entries = append(tx.entries, transactionEntry{
+			flag:    flag,
+			tv:      tv,
+			changed: flag.Changed,
+			name:    f.normalizeFlagName(flag.Name),
+		})
+	}
+	f.transaction = tx
+}
+
+// rollbackTransaction restores the baseline captured by beginTransaction on
+// every participating value and reverses only those flags' Changed updates
+// made by the failed parse. Other flags keep their per-Set behavior.
+func (f *FlagSet) rollbackTransaction() {
+	tx := f.transaction
+	if tx == nil {
+		return
+	}
+	for _, entry := range tx.entries {
+		entry.tv.RollbackTransaction()
+		entry.flag.Changed = entry.changed
+	}
+	// Drop the Visit bookkeeping for transactional flags that were unset
+	// before this parse. Flags already set before, and non-transactional
+	// flags set during the failed parse, are left intact.
+	removed := make(map[NormalizedName]struct{})
+	for _, entry := range tx.entries {
+		if !entry.changed {
+			delete(f.actual, entry.name)
+			removed[entry.name] = struct{}{}
+		}
+	}
+	if len(removed) > 0 {
+		kept := make([]*Flag, 0, len(f.orderedActual))
+		for _, fl := range f.orderedActual {
+			if _, ok := removed[f.normalizeFlagName(fl.Name)]; ok && !fl.Changed {
+				continue
+			}
+			kept = append(kept, fl)
+		}
+		f.orderedActual = kept
+		f.sortedActual = nil
+	}
+	f.transaction = nil
+}
+
 // Parse parses flag definitions from the argument list, which should not
 // include the command name.  Must be called after all flags in the FlagSet
 // are defined and before flags are accessed by the program.
@@ -1303,12 +1395,25 @@ func (f *FlagSet) Parse(arguments []string) error {
 		return nil
 	}
 
+	// Give transactional values (e.g. intList) a snapshot of the baseline
+	// that this parse starts from. If any flag fails to parse, the whole
+	// transaction is rolled back to that baseline.
+	f.beginTransaction()
+
 	set := func(flag *Flag, value string) error {
 		return f.Set(flag.Name, value)
 	}
 
 	err := f.parseArgs(arguments, set)
 	if err != nil {
+		// ErrHelp means the user requested help, not that an operation was
+		// invalid: commit the flags parsed so far, matching the other Value
+		// types. Any other error rolls the whole transaction back.
+		if err != ErrHelp { //nolint:errorlint // not using errors.Is for compatibility with go1.12
+			f.rollbackTransaction()
+		} else {
+			f.transaction = nil
+		}
 		switch f.errorHandling {
 		case ContinueOnError:
 			return err
@@ -1322,6 +1427,9 @@ func (f *FlagSet) Parse(arguments []string) error {
 			panic(err)
 		}
 	}
+	// The parse completed without errors: commit the transaction and keep
+	// the values as they were set.
+	f.transaction = nil
 	return nil
 }
 
