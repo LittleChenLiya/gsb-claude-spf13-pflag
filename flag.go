@@ -222,6 +222,17 @@ type Flag struct {
 	Hidden              bool                // used by cobra.Command to allow flags to be hidden from help/usage text
 	ShorthandDeprecated string              // If the shorthand of this flag is deprecated, this string is the new or now thing to use
 	Annotations         map[string][]string // used by cobra.Command bash autocomple code
+
+	// defaultSnapshot is a deep copy of the value at registration time,
+	// used by the default snapshot API. It is never modified after
+	// registration.
+	defaultSnapshot Value
+	// snapshotErr records the error encountered while building the
+	// default snapshot, if the value type has no snapshot strategy.
+	snapshotErr error
+	// changeSource records how the current value came to differ from the
+	// registered default.
+	changeSource ChangeSource
 }
 
 // Value is the interface to the dynamic value stored in a flag.
@@ -539,14 +550,23 @@ func ShorthandLookup(name string) *Flag {
 	return CommandLine.ShorthandLookup(name)
 }
 
-// Set sets the value of the named flag.
+// Set sets the value of the named flag. A value set through Set is
+// reported as SourceSet by the default snapshot API.
 func (f *FlagSet) Set(name, value string) error {
 	normalName := f.normalizeFlagName(name)
 	flag, ok := f.formal[normalName]
 	if !ok {
 		return &NotExistError{name: name, messageType: flagNoSuchFlagMessage}
 	}
+	return f.setFlag(flag, value, SourceSet)
+}
 
+// setFlag sets the value of flag and records how the value came to
+// differ from its registered default. src is SourceParse for values set
+// by an explicit Parse call and SourceSet for values set by a direct
+// caller Set. The source is recorded as the flag is set, so it is never
+// fabricated by re-parsing.
+func (f *FlagSet) setFlag(flag *Flag, value string, src ChangeSource) error {
 	err := flag.Value.Set(value)
 	if err != nil {
 		return &InvalidValueError{
@@ -560,11 +580,13 @@ func (f *FlagSet) Set(name, value string) error {
 		if f.actual == nil {
 			f.actual = make(map[NormalizedName]*Flag)
 		}
-		f.actual[normalName] = flag
+		f.actual[f.normalizeFlagName(flag.Name)] = flag
 		f.orderedActual = append(f.orderedActual, flag)
 
 		flag.Changed = true
 	}
+
+	flag.changeSource = src
 
 	if flag.Deprecated != "" {
 		_, _ = fmt.Fprintf(f.Output(), "Flag --%s has been deprecated, %s\n", flag.Name, flag.Deprecated)
@@ -957,6 +979,19 @@ func (f *FlagSet) AddFlag(flag *Flag) {
 	if flag.NoOptDefVal == "" && isNoOptBoolValue(flag.Value) {
 		flag.NoOptDefVal = "true"
 	}
+	// Snapshot the default value at registration time so later mutations
+	// of the caller's value do not affect the recorded default. This
+	// never guesses a value's shape from its String representation; a
+	// value type is either a built-in pflag knows how to copy or it
+	// implements ValueSnapshot. Unknown types are recorded as an error
+	// that the snapshot query returns, not silently guessed.
+	if flag.Value != nil {
+		var ok bool
+		flag.defaultSnapshot, ok = snapshotValue(flag.Value)
+		if !ok {
+			flag.snapshotErr = fmt.Errorf("pflag: flag %q of type %T does not support default snapshots; implement pflag.ValueSnapshot", flag.Name, flag.Value)
+		}
+	}
 	f.formal[normalizedFlagName] = flag
 	f.orderedFormal = append(f.orderedFormal, flag)
 
@@ -1304,7 +1339,7 @@ func (f *FlagSet) Parse(arguments []string) error {
 	}
 
 	set := func(flag *Flag, value string) error {
-		return f.Set(flag.Name, value)
+		return f.setFlag(flag, value, SourceParse)
 	}
 
 	err := f.parseArgs(arguments, set)
