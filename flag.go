@@ -206,6 +206,9 @@ type FlagSet struct {
 	interspersed      bool      // allow interspersed option/non-option args
 	normalizeNameFunc func(f *FlagSet, name string) NormalizedName
 
+	snapshots     map[NormalizedName]*flagSnapshotRecord // registration-time default snapshots
+	changeSources map[NormalizedName]ChangeSource        // how each flag was first changed
+
 	addedGoFlagSets []*goflag.FlagSet
 }
 
@@ -547,6 +550,13 @@ func (f *FlagSet) Set(name, value string) error {
 		return &NotExistError{name: name, messageType: flagNoSuchFlagMessage}
 	}
 
+	return f.setFlagValue(flag, normalName, value, ChangeSourceSet)
+}
+
+// setFlagValue sets the value of flag and records, the first time the flag
+// is changed, whether the change came from an explicit Set call or from
+// parsing command-line arguments.
+func (f *FlagSet) setFlagValue(flag *Flag, normalName NormalizedName, value string, source ChangeSource) error {
 	err := flag.Value.Set(value)
 	if err != nil {
 		return &InvalidValueError{
@@ -564,6 +574,11 @@ func (f *FlagSet) Set(name, value string) error {
 		f.orderedActual = append(f.orderedActual, flag)
 
 		flag.Changed = true
+
+		if f.changeSources == nil {
+			f.changeSources = make(map[NormalizedName]ChangeSource)
+		}
+		f.changeSources[normalName] = source
 	}
 
 	if flag.Deprecated != "" {
@@ -960,6 +975,11 @@ func (f *FlagSet) AddFlag(flag *Flag) {
 	f.formal[normalizedFlagName] = flag
 	f.orderedFormal = append(f.orderedFormal, flag)
 
+	// Capture the explicit default-value snapshot at registration time.
+	// This is read-only with respect to the flag: it does not touch
+	// Changed, NoOptDefVal, or the flag ordering.
+	f.captureSnapshot(normalizedFlagName, flag)
+
 	if flag.Shorthand == "" {
 		return
 	}
@@ -1304,7 +1324,7 @@ func (f *FlagSet) Parse(arguments []string) error {
 	}
 
 	set := func(flag *Flag, value string) error {
-		return f.Set(flag.Name, value)
+		return f.setFlagValue(flag, f.normalizeFlagName(flag.Name), value, ChangeSourceParse)
 	}
 
 	err := f.parseArgs(arguments, set)
